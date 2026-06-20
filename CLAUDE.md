@@ -128,3 +128,10 @@ The patcher runs an upgrade cascade on every boot: `v1 → v2 → v3`. Already-p
 - `permissions.defaultMode=auto` and `skipDangerousModePermissionPrompt=true` are written into `~/.claude/settings.json` on every boot by `pre_accept_bypass_permissions`. The chat-driven workflow requires `auto` (plan mode blocks the Telegram `reply` MCP call → looks like the agent ghosts every message).
 - `gum` is optional — the wizard falls back to `scripts/lib/wizard.sh` (plain `read`) when stdin is not a TTY (CI, piped tests). Don't add gum-only behavior without a non-gum fallback in `wizard.sh`.
 - Library files sourced by both `heartbeatctl` and bats tests guard their initialization with `BASH_SOURCE`-style checks so `source` doesn't run side-effecting code at load time. Preserve that pattern when adding new shared libs.
+
+<!-- SPECKIT START -->
+Active spec-kit feature: **001-deps-upgrade** — reproducible in-container dependency
+upgrades (resolve-and-record latest-stable toolchain via `agent.yml`).
+Plan: `specs/001-deps-upgrade/plan.md` · Spec: `specs/001-deps-upgrade/spec.md` ·
+Constitution: `.specify/memory/constitution.md`.
+<!-- SPECKIT END -->
