@@ -145,6 +145,12 @@ SESSION="agent"
 WORKDIR="/workspace"
 CLAUDE_CONFIG_DIR_VAL="/home/agent/.claude"
 REQUIRED_CHANNEL_PLUGIN="telegram@claude-plugins-official"
+# Official Claude plugin marketplace — single-sourced so ensure_official_marketplace
+# (registration) and plugin_cache_dir_for (cache key) agree on the name. Headless
+# token auth skips the interactive onboarding that used to seed it, so the
+# supervisor registers it explicitly at boot.
+OFFICIAL_MARKETPLACE_NAME="claude-plugins-official"
+OFFICIAL_MARKETPLACE_SOURCE="anthropics/claude-plugins-official"
 
 # Watchdog runtime state — lives on tmpfs (/tmp) so it resets every
 # container start. CHANNEL_MARKER is touched by start_session after a
@@ -364,6 +370,14 @@ has_telegram_token() {
   [ -n "$val" ]
 }
 
+# Whether the container env carries a non-empty CLAUDE_CODE_OAUTH_TOKEN (from
+# `claude setup-token`, delivered via docker-compose env_file). When present,
+# claude authenticates from the environment, so the supervisor must not fall
+# back to the bare-claude /login path. NEVER echo the value (secret hygiene).
+has_oauth_token() {
+  [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]
+}
+
 # Pre-configure the user's Claude settings for headless operation:
 #   - skipDangerousModePermissionPrompt=true — dismiss the one-time
 #     `--dangerously-skip-permissions` warning dialog so the first launch
@@ -381,7 +395,13 @@ has_telegram_token() {
 # once here covers both launch paths.
 pre_accept_bypass_permissions() {
   local settings="$HOME/.claude/settings.json"
-  [ -f "$settings" ] || return 0
+  # Create settings.json if absent so the headless defaults apply on first boot —
+  # the bind-mount config dir may have no settings yet before claude's first run
+  # (previously this early-returned and never seeded on a fresh agent).
+  if [ ! -f "$settings" ]; then
+    mkdir -p "$(dirname "$settings")" 2>/dev/null || true
+    echo '{}' > "$settings" 2>/dev/null || return 0
+  fi
   local need_skip need_mode
   need_skip=$(jq -r '.skipDangerousModePermissionPrompt // false' "$settings" 2>/dev/null || echo "false")
   need_mode=$(jq -r '.permissions.defaultMode // ""' "$settings" 2>/dev/null || echo "")
@@ -398,6 +418,32 @@ pre_accept_bypass_permissions() {
     mv "$tmp" "$settings"
   else
     rm -f "$tmp"
+  fi
+}
+
+# pre_seed_onboarding — pre-populate ~/.claude/.claude.json so the first-run
+# onboarding (theme picker + per-project trust dialog) doesn't block the headless
+# tmux session. These keys live in .claude.json, NOT settings.json (adding them
+# to settings.json trips a schema error). Creates the file if absent; idempotent
+# jq-merge that preserves an existing theme; fail-silent — never block boot.
+pre_seed_onboarding() {
+  command -v jq >/dev/null 2>&1 || return 0
+  local cfg="${CLAUDE_CONFIG_DIR_VAL}/.claude.json"
+  local workdir="${WORKDIR:-/workspace}"
+  mkdir -p "$(dirname "$cfg")" 2>/dev/null || true
+  [ -f "$cfg" ] || echo '{}' > "$cfg" 2>/dev/null || return 0
+  local tmp
+  tmp=$(mktemp) || return 0
+  if jq --arg wd "$workdir" '
+        .hasCompletedOnboarding = true
+        | .theme = (.theme // "dark")
+        | .projects = ((.projects // {}) | .[$wd] = ((.[$wd] // {}) + {hasTrustDialogAccepted: true}))
+      ' "$cfg" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$cfg"
+    chmod 0644 "$cfg" 2>/dev/null || true
+  else
+    rm -f "$tmp"
+    log "WARN: failed to pre-seed onboarding in $cfg"
   fi
 }
 
@@ -434,6 +480,27 @@ pre_accept_extra_marketplaces() {
   fi
 }
 
+# ensure_official_marketplace — register the official Claude plugin marketplace
+# so @claude-plugins-official plugins (incl. the channel) can install. Headless
+# token auth skips the interactive onboarding that used to seed it. Idempotent
+# (guarded by `marketplace list`) and fail-silent: a slow/failed git clone over
+# the VirtioFS bind-mount must never block or crash the watchdog tick.
+ensure_official_marketplace() {
+  command -v claude >/dev/null 2>&1 || return 0
+  if CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR_VAL" claude plugin marketplace list 2>/dev/null \
+       | grep -q "$OFFICIAL_MARKETPLACE_NAME"; then
+    return 0   # already registered
+  fi
+  log "registering official marketplace: $OFFICIAL_MARKETPLACE_SOURCE"
+  if CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR_VAL" \
+       claude plugin marketplace add "$OFFICIAL_MARKETPLACE_SOURCE" --scope user >/dev/null 2>&1; then
+    log "official marketplace registered: $OFFICIAL_MARKETPLACE_NAME"
+  else
+    log "WARN: official marketplace registration failed (will retry next tick)"
+  fi
+  return 0
+}
+
 # Build the next tmux command based on current state. Three cases:
 #   A. Not authenticated → bare `claude` so the user can `/login`.
 #   B. Authenticated, no Telegram bot token yet → interactive wizard to
@@ -448,11 +515,15 @@ next_tmux_cmd() {
   # install needs auth), but on subsequent respawns it picks up the
   # full catalog (5 defaults + any opt-ins the user selected at scaffold).
   pre_accept_extra_marketplaces
+  ensure_official_marketplace
   ensure_all_plugins_installed
 
-  if ! _channel_plugin_ready; then
-    # Case A: channel plugin not yet usable (no /login, or install failed).
-    # Fall back to bare claude so the user can authenticate.
+  if ! _channel_plugin_ready && ! has_oauth_token; then
+    # Case A: channel plugin not yet usable (no /login, or install failed) AND
+    # no headless token. Fall back to bare claude so the user can /login.
+    # With CLAUDE_CODE_OAUTH_TOKEN present, claude is already authenticated, so
+    # we never park at a /login prompt — drop through to Case B/C and let
+    # ensure_all_plugins_installed keep retrying on subsequent respawns.
     echo "$base"
     return
   fi
@@ -521,6 +592,7 @@ start_session() {
   # that ends up passing --dangerously-skip-permissions boots cleanly,
   # regardless of which case next_tmux_cmd picked.
   pre_accept_bypass_permissions
+  pre_seed_onboarding
 
   local cmd
   cmd=$(next_tmux_cmd)
@@ -833,6 +905,10 @@ _prev_auth_present=-1
 # on completion or budget exhaustion.
 _post_login_deadline=0
 _check_auth_flip() {
+  # Env-token auth (CLAUDE_CODE_OAUTH_TOKEN) writes no .credentials.json, so the
+  # agent is already authenticated at baseline — pin _prev_auth_present so the
+  # absent->present file flip can never fire a spurious kill-session.
+  if has_oauth_token; then _prev_auth_present=1; return 0; fi
   local present=0
   if [ -f "$(_auth_marker_file)" ]; then present=1; fi
 
