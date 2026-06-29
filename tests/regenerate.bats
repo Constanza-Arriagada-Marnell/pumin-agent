@@ -92,9 +92,22 @@ teardown() { teardown_tmp_dir; }
   [ -f .mcp.json ]
   [ -f CLAUDE.md ]
   jq -e '.mcpServers.vault' .mcp.json > /dev/null
-  [ "$(jq -r '.mcpServers.vault.args[1]' .mcp.json)" = "@bitbonsai/mcpvault@latest" ]
+  [ "$(jq -r '.mcpServers.vault.args[1]' .mcp.json)" = "@bitbonsai/mcpvault@0.12.0" ]
   grep -q "Vault" CLAUDE.md
   grep -q "Karpathy" CLAUDE.md
+}
+
+@test "--regenerate backfills vault.qmd.version and renders a valid qmd pin (pre-010 upgrade)" {
+  cd "$TMP_TEST_DIR"
+  # Simulate a pre-010 workspace that opted into QMD before the version pin
+  # existed: enabled=true, no version key (mcp-json.tpl would otherwise render a
+  # broken "@tobilu/qmd@"). The regenerate path must backfill the floor so the
+  # pin stays valid (contracts/agent-yml-schema.md; agent.yml as single source).
+  yq -i '.vault.qmd.enabled = true' agent.yml
+  echo 'n' | ./setup.sh --regenerate
+  [ "$(yq -r '.vault.qmd.version' agent.yml)" = "2.5.3" ]
+  [ "$(jq -r '.mcpServers.qmd.args[0]' .mcp.json)" = "@tobilu/qmd@2.5.3" ]
+  [ "$(jq -r '.mcpServers.qmd.args[1]' .mcp.json)" = "mcp" ]
 }
 
 @test "--non-interactive regenerate skips plugin prompt" {
@@ -102,4 +115,16 @@ teardown() { teardown_tmp_dir; }
   run ./setup.sh --non-interactive
   [ "$status" -eq 0 ]
   [ -f .mcp.json ]
+}
+
+@test "--regenerate injects the role_file persona into CLAUDE.md (survives, content re-read)" {
+  cd "$TMP_TEST_DIR"
+  mkdir -p personas
+  printf 'PERSONA_REGEN_MARKER multi-paragraph persona.\n\nSecond paragraph.\n' > personas/regen-bot.md
+  yq -i '.agent.role_file = "personas/regen-bot.md"' agent.yml
+  echo 'n' | ./setup.sh --regenerate
+  # role_file path persists in agent.yml (single source of truth)…
+  grep -q 'role_file:' agent.yml
+  # …and its content is re-read into the rendered CLAUDE.md (FR-I1/FR-X1).
+  grep -q "PERSONA_REGEN_MARKER" CLAUDE.md
 }

@@ -128,3 +128,36 @@ The patcher runs an upgrade cascade on every boot: `v1 → v2 → v3`. Already-p
 - `permissions.defaultMode=auto` and `skipDangerousModePermissionPrompt=true` are written into `~/.claude/settings.json` on every boot by `pre_accept_bypass_permissions`. The chat-driven workflow requires `auto` (plan mode blocks the Telegram `reply` MCP call → looks like the agent ghosts every message).
 - `gum` is optional — the wizard falls back to `scripts/lib/wizard.sh` (plain `read`) when stdin is not a TTY (CI, piped tests). Don't add gum-only behavior without a non-gum fallback in `wizard.sh`.
 - Library files sourced by both `heartbeatctl` and bats tests guard their initialization with `BASH_SOURCE`-style checks so `source` doesn't run side-effecting code at load time. Preserve that pattern when adding new shared libs.
+
+<!-- SPECKIT START -->
+Active spec-kit feature: **010-self-managing-rag** — make the QMD semantic-search engine over the
+agent's Obsidian vault self-managing when `vault.qmd.enabled=true` (opt-in, zero-touch). Three
+problems today (`modules/mcp-json.tpl:72-77`): (a) `bunx @tobilu/qmd@latest mcp` is UNPINNED
+(Principle VI), (b) no auto-setup — the ~300MB embedding model + index never build themselves, (c) no
+auto-reindex — the index goes stale after first boot. Design (research D1–D9, brainstormed + approved):
+**US1** `qmd_setup_if_needed` (new `docker/scripts/lib/qmd_index.sh`) downloads model + builds the index
+at first boot, **backgrounded + timeout-bounded** from `boot_side_effects` (never blocks the watchdog,
+Principle IV), idempotent by sentinel+`index.sqlite`. **US2** dual-trigger reindex: an inotify watcher
+`docker/scripts/qmd_watch.sh` (new apk `inotify-tools`) with ~15s debounce for immediacy + a `*/5` cron
+backstop line in `heartbeatctl cmd_reload` — both call ONE `heartbeatctl qmd-reindex` → `qmd_reindex`
+(flock-guarded via `flock` already in image; hash-debounced reusing `backup_vault.sh::vault_hash`;
+atomic `qmd-index.json`). The watcher captures changes from MCPVault, native Write/Edit, AND Syncthing;
+respawned by a DETERMINISTIC PID-liveness check in the 2s poll (NOT the reverted heuristic bridge
+watchdog). **US3** pin `@tobilu/qmd@2.5.3` single-sourced via `agent.yml` `vault.qmd.version` (rendered
+into the template + read by the lib — no duplicate pin) + `schema.sh` validation for
+`vault.qmd.{enabled,version,schedule}`.
+KEY RESEARCH CORRECTION: the assumed `@tobilu/qmd@0.4.4` DOES NOT EXIST on npm; latest stable is
+**2.5.3** (CLI confirmed: `collection add`/`update`/`embed`/`mcp`; storage `~/.cache/qmd/` → under
+`.state`, persists, model downloads at first boot). Model/index/state live under the durable `.state`
+home; the index is regenerable so it is intentionally NOT added to `backup/vault`. Two new image-baked
+files each need their Dockerfile COPY (008/009 lesson). Test-first host-side
+(qmd-index/setup/watch/reindex-cmd bats + schema/mcp-json/scaffold pin updates) + DOCKER_E2E for
+first-boot setup, inotify-under-bind-mount, and cron backstop. CHANGELOG + VERSION 0.4.3→0.4.4.
+Plan: `specs/010-self-managing-rag/plan.md` · Spec: `specs/010-self-managing-rag/spec.md` ·
+Research: `specs/010-self-managing-rag/research.md` · Contracts: `specs/010-self-managing-rag/contracts/` ·
+Constitution: `.specify/memory/constitution.md`.
+Prior: 001-deps-upgrade (PR #55), 002-fix-schema-bool, 003-bootstrap-hardening (PR #56),
+004-macos-bootstrap-hardening (PR #59), 005-fix-schema-false (PR #60), 006-headless-bootstrap (PR #61),
+007-fix-mcp-test-drift (PR #62), 008-fix-postlogin-plugin-install (PR #63),
+009-fix-extra-marketplace-install (PR #64) — all merged.
+<!-- SPECKIT END -->

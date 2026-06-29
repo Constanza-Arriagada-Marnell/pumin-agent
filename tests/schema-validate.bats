@@ -117,6 +117,26 @@ YML
   [[ "$output" == *"heartbeat.enabled must be a YAML boolean"* ]]
 }
 
+# 005-fix-schema-false: a required boolean leaf set to its valid `false` value
+# must validate — it is PRESENT, not missing. Regression: `yq '$path // ""'`
+# collapsed a present `false` to "" so the required-leaf check wrongly flagged
+# it as a missing field, blocking --regenerate for any feature-disabled agent.
+@test "agent_yml_validate: required boolean leaf set to false validates (not 'missing')" {
+  _write_valid_yml
+  yq -i '.features.heartbeat.enabled = false' "$TMP_TEST_DIR/agent.yml"
+  run agent_yml_validate "$TMP_TEST_DIR/agent.yml"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "agent_yml_validate: genuinely absent required boolean leaf still reported missing" {
+  _write_valid_yml
+  yq -i 'del(.features.heartbeat.enabled)' "$TMP_TEST_DIR/agent.yml"
+  run agent_yml_validate "$TMP_TEST_DIR/agent.yml"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"missing required field: .features.heartbeat.enabled"* ]]
+}
+
 @test "agent_yml_validate: aggregates multiple errors in one run" {
   _write_valid_yml
   yq -i 'del(.user.email) | del(.user.timezone) | .notifications.channel = "bogus"' \
@@ -128,4 +148,92 @@ YML
   [[ "$output" == *".user.email"* ]]
   [[ "$output" == *".user.timezone"* ]]
   [[ "$output" == *"channel must be one of"* ]]
+}
+
+@test "agent_yml_validate: valid toolchain channel passes" {
+  _write_valid_yml
+  yq -i '.docker.toolchain_channels.claude_code = "pinned"' "$TMP_TEST_DIR/agent.yml"
+  run agent_yml_validate "$TMP_TEST_DIR/agent.yml"
+  [ "$status" -eq 0 ]
+}
+
+@test "agent_yml_validate: invalid toolchain channel → reported" {
+  _write_valid_yml
+  yq -i '.docker.toolchain_channels.claude_code = "bleeding"' "$TMP_TEST_DIR/agent.yml"
+  run agent_yml_validate "$TMP_TEST_DIR/agent.yml"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"toolchain_channels"* ]]
+  [[ "$output" == *"bleeding"* ]]
+}
+
+@test "agent_yml_validate: absent toolchain_channels still validates (legacy-safe)" {
+  _write_valid_yml
+  run agent_yml_validate "$TMP_TEST_DIR/agent.yml"
+  [ "$status" -eq 0 ]
+}
+
+@test "agent_yml_validate: role_file present and non-empty validates" {
+  _write_valid_yml
+  yq -i '.agent.role_file = "personas/validbot.md"' "$TMP_TEST_DIR/agent.yml"
+  run agent_yml_validate "$TMP_TEST_DIR/agent.yml"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "agent_yml_validate: role_file present but empty → reported" {
+  _write_valid_yml
+  yq -i '.agent.role_file = ""' "$TMP_TEST_DIR/agent.yml"
+  run agent_yml_validate "$TMP_TEST_DIR/agent.yml"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"role_file"* ]]
+}
+
+# 010-self-managing-rag: vault.qmd.* validation.
+@test "agent_yml_validate: vault.qmd.enabled bool typo (ture) → reported" {
+  _write_valid_yml
+  yq -i '.vault.qmd.enabled = "ture"' "$TMP_TEST_DIR/agent.yml"
+  run agent_yml_validate "$TMP_TEST_DIR/agent.yml"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"vault.qmd.enabled must be a YAML boolean"* ]]
+}
+
+@test "agent_yml_validate: vault.qmd.enabled=false validates (present, not missing)" {
+  _write_valid_yml
+  yq -i '.vault.qmd.enabled = false' "$TMP_TEST_DIR/agent.yml"
+  run agent_yml_validate "$TMP_TEST_DIR/agent.yml"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "agent_yml_validate: vault.qmd.version present but empty → reported" {
+  _write_valid_yml
+  yq -i '.vault.qmd.version = ""' "$TMP_TEST_DIR/agent.yml"
+  run agent_yml_validate "$TMP_TEST_DIR/agent.yml"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"vault.qmd.version"* ]]
+}
+
+@test "agent_yml_validate: well-formed vault.qmd block validates" {
+  _write_valid_yml
+  yq -i '.vault.enabled = true | .vault.qmd.enabled = true | .vault.qmd.version = "2.5.3" | .vault.qmd.schedule = "*/5 * * * *"' "$TMP_TEST_DIR/agent.yml"
+  run agent_yml_validate "$TMP_TEST_DIR/agent.yml"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "agent_yml_validate: vault.qmd.enabled=true without version validates (regenerate backfills the pin)" {
+  # The pre-010 upgrade path: QMD opted in, no version key yet. Schema must NOT
+  # block this — setup.sh --regenerate backfills vault.qmd.version=2.5.3 so the
+  # rendered pin stays valid (contracts/agent-yml-schema.md). Fail-loud here
+  # would break the documented zero-touch upgrade.
+  _write_valid_yml
+  yq -i '.vault.enabled = true | .vault.qmd.enabled = true' "$TMP_TEST_DIR/agent.yml"
+  run agent_yml_validate "$TMP_TEST_DIR/agent.yml"
+  [ "$status" -eq 0 ]
+}
+
+@test "agent_yml_validate: absent vault.qmd still validates (legacy-safe)" {
+  _write_valid_yml
+  run agent_yml_validate "$TMP_TEST_DIR/agent.yml"
+  [ "$status" -eq 0 ]
 }

@@ -2,7 +2,263 @@
 
 ## [Unreleased]
 
-_No entries since 0.1.0._
+### Added
+- **Self-managing RAG** (`010-self-managing-rag`): when `vault.qmd.enabled=true`,
+  the QMD semantic-search engine over the agent's Obsidian vault now sets itself
+  up and stays fresh with zero manual steps (opt-in; zero cost when disabled).
+  Specced with GitHub Spec Kit under `specs/010-self-managing-rag/`.
+  - **(US1)** Auto-setup at boot: `qmd_setup_if_needed`
+    (`docker/scripts/lib/qmd_index.sh`) downloads the embedding model + builds the
+    index on first boot, run **backgrounded + timeout-bounded** from
+    `boot_side_effects` so it never blocks the watchdog (Principle IV). Idempotent
+    by sentinel + `index.sqlite` presence. Model/index live under
+    `~/.cache/qmd/` → durable in `.state` (download at first boot, since the
+    bind-mount shadows a pre-baked home).
+  - **(US2)** Dual-trigger auto-reindex: an inotify watcher
+    (`docker/scripts/qmd_watch.sh`, new `inotify-tools` dependency) with ~15s
+    debounce for immediacy, plus a `*/5` cron backstop line in `heartbeatctl
+    reload` — both route through one `heartbeatctl qmd-reindex` → `qmd_reindex`,
+    which is `flock`-guarded (concurrency-safe) and hash-debounced (reuses
+    `backup_vault.sh::vault_hash`; skips the costly embed when the vault is
+    unchanged). The watcher captures changes from MCPVault, native Write/Edit,
+    and Syncthing; it is respawned by a deterministic PID-liveness check in the
+    2s watchdog poll (NOT the reverted heuristic bridge watchdog). State in
+    `scripts/heartbeat/qmd-index.json`.
+  - **(US3)** Reproducible pin: `@tobilu/qmd` is pinned to **`2.5.3`** (the
+    floating `@latest` is gone), single-sourced via `agent.yml`
+    `vault.qmd.version` (rendered into `.mcp.json` and read by the lib — no
+    duplicate pin, Principle VI). `schema.sh` now validates
+    `vault.qmd.{enabled,version,schedule}`.
+  - NOTE: the previously-assumed `@tobilu/qmd@0.4.4` does not exist on npm; the
+    research phase corrected the pin to the actual latest stable, `2.5.3`.
+    `inotify` under the macOS VirtioFS bind-mount may not deliver host-origin
+    events; the cron backstop covers that. The derived index is intentionally
+    NOT added to `backup/vault` (it is regenerable from the markdown).
+- **Headless bootstrap** (`006-headless-bootstrap`): a scaffolded agent boots
+  fully operational WITHOUT interactive `/login`, which does not persist in the
+  headless container — VirtioFS cache incoherence on the `~/.claude` bind-mount
+  drops the credential, so `/login` completes server-side ("Login successful")
+  but reverts to "Not logged in" on every boot. Specced with GitHub Spec Kit
+  under `specs/006-headless-bootstrap/`.
+  - **(US1)** Headless auth via `CLAUDE_CODE_OAUTH_TOKEN` (from `claude
+    setup-token`) placed in `.env`, which docker-compose injects via `env_file`
+    — no dependency on `~/.claude` persistence. The supervisor recognizes the
+    token (`has_oauth_token`): `next_tmux_cmd` never falls back to the
+    bare-claude `/login` path when a token is present, and `_check_auth_flip`
+    treats the agent as already-authenticated (no spurious session kick from a
+    stray `.credentials.json`). The generated `.env` and `.env.example` carry a
+    `CLAUDE_CODE_OAUTH_TOKEN=` placeholder; the token stays out of `agent.yml`.
+    NEXT_STEPS (en/es) document the headless path as recommended, `/login` as
+    fallback.
+  - **(US2)** The official marketplace `anthropics/claude-plugins-official` is
+    registered idempotently at boot (`ensure_official_marketplace`) before
+    installing plugins — headless token auth skips the interactive onboarding
+    that used to seed it, so without this no `@claude-plugins-official` plugin
+    (incl. the Telegram channel) could install.
+  - **(US3)** First-run onboarding (theme picker + per-directory trust) is
+    pre-seeded in `~/.claude/.claude.json` (`pre_seed_onboarding`), and
+    `settings.json` is now created when absent, so the headless TUI session
+    isn't blocked before the first launch.
+  - **(US4)** The watchdog log distinguishes "marketplace not found" from "not
+    authenticated" (`retry_plugin_install_bounded`), instead of the catch-all
+    that conflated the two and burned the retry budget.
+  - The token lives only in `.env` (0600, and encrypted `.env.age` in identity
+    backup); relocating `~/.claude` to a named volume is out of scope (it would
+    re-introduce the `down -v` login-wipe that PR #3 removed).
+
+### Fixed
+- **Third-party marketplace plugin install at boot**
+  (`009-fix-extra-marketplace-install`): a plugin declared in `agent.yml` that
+  lives in a third-party marketplace (e.g. `claude-mem@thedotmack`) was never
+  auto-installed at boot — found during the 2026-06-23 declarative re-scaffold of
+  rodri-cenco-admin (5/6 plugins installed, claude-mem did not). Root cause
+  (runtime log + code): a registration asymmetry. The official marketplace is
+  registered with `claude plugin marketplace add` AND confirmed via
+  `marketplace list` (`ensure_official_marketplace`), but third-party
+  marketplaces were only merged into `settings.json`'s `extraKnownMarketplaces`
+  by `pre_accept_extra_marketplaces` (no `add`, no confirm). So the immediate
+  `claude plugin install claude-mem@thedotmack` errored "marketplace not found",
+  `retry_plugin_install_bounded` returned 2 (skip, no retry), and because the
+  steady-state tmux session never respawns, `ensure_all_plugins_installed` never
+  re-ran → the plugin stayed permanently absent.
+  - **(US1)** New `ensure_extra_marketplaces` in `docker/scripts/start_services.sh`
+    resolves each declared third-party marketplace with a confirmed
+    `claude plugin marketplace add <repo>` (mirror of `ensure_official_marketplace`),
+    chained in `next_tmux_cmd` before the install loop, so the plugin installs at
+    boot with no manual `plugin install`.
+  - **(US2)** Each `claude` call in the new helper is bounded by
+    `timeout ${MARKETPLACE_CMD_TIMEOUT:-12}` (degrades to a direct call if absent)
+    and is idempotent + fail-silent (guarded by `marketplace list`; always
+    returns 0) — a slow git clone over VirtioFS can never hang the boot before
+    the watchdog (Principle IV).
+  - **(US3)** `tests/docker-e2e-postlogin.bats` now declares a third-party plugin
+    and its `claude` stub models marketplace resolution (a plugin only installs
+    once its marketplace was `add`-ed), closing the E2E gap that hid the bug
+    (the suite previously exercised only `@claude-plugins-official`).
+  - Test-first host-side: `tests/start-services-extra-marketplace.bats` (registers
+    when absent, idempotent when resolved, bounded when claude hangs, degrades
+    without `timeout`, no-op without claude). No changes to
+    `setup.sh`/`modules/`/`scripts/lib/` (the marketplace derivation already
+    exists via `plugin_catalog_marketplaces_json`).
+- **Post-login plugin auto-install path** (`008-fix-postlogin-plugin-install`):
+  full DOCKER_E2E validation after #61/#62 surfaced `docker-e2e-postlogin`
+  failing (channel plugin never auto-installed after the credential flip). Three
+  chained defects, root-caused with runtime evidence (hung container process
+  tree) + static analysis:
+  - **(US1)** Feature 006's `ensure_official_marketplace` runs
+    `claude plugin marketplace list | grep` in the boot path; the e2e `claude`
+    stub (from 004) only handled `plugin install` and fell through to
+    `exec sleep 86400`, so the pipe hung the supervisor before tmux/the watchdog
+    ever started → 0 installs. The stub now handles the whole `plugin` family
+    (`marketplace list/add`, `plugin list`) non-blocking; only the interactive
+    session sleeps.
+  - **(US2)** Hardened `ensure_official_marketplace` to bound its `claude` calls
+    with `timeout` (configurable via `MARKETPLACE_CMD_TIMEOUT`, degrades to a
+    direct call if `timeout` is absent), so a wedged CLI can never hang the boot
+    before the watchdog can recover it (Principle IV).
+  - **(US3)** `docker/scripts/lib/plugin-install.sh` (defines
+    `retry_plugin_install_bounded`) reached the workspace via the wholesale
+    `docker/` copy but the Dockerfile never `COPY`d it into the image, so the
+    bounded retry (004 US2) and the marketplace-not-found classification (006
+    US4) were dead code and the supervisor used the legacy single-attempt path.
+    Added the missing `COPY` line (the lib is image-only — `mirror_catalog_to_docker`
+    is not involved). Test-first host-side for US2/US3; validated with a rebuild
+    + the full DOCKER_E2E suite. Specced under `specs/008-fix-postlogin-plugin-install/`.
+- **MCP render-contract test drift** (`007-fix-mcp-test-drift`): the default
+  `bats` suite was at 668 tests / 6 failing on `main` because six assertions
+  still encoded the pre-#59 MCP contract. PR #59 deliberately migrated the
+  `github` MCP from `npx @modelcontextprotocol/server-github` to the native
+  image-baked `github-mcp-server` (args `["stdio"]`) and pinned the `vault` MCP
+  from `@bitbonsai/mcpvault@latest` to `@bitbonsai/mcpvault@0.12.0` (sourced from
+  `AGENTIC_FLOOR_MCP_VAULT` in `scripts/lib/versions.sh`); the templates were
+  correct, the assertions were stale. Aligned the assertions in
+  `tests/mcp-json.bats` (github + vault), `tests/regenerate.bats` and
+  `tests/scaffold.bats` to the shipped contract — test-only, no template/runtime
+  change — returning the suite to fully green. Out of scope: collapsing the
+  duplicated `0.12.0` literal (template vs `versions.sh`) into a single source
+  (pre-existing Principle VI debt). Specced under `specs/007-fix-mcp-test-drift/`.
+- **Schema validation accepts a present boolean `false`** (`005-fix-schema-false`):
+  `agent_yml_validate` no longer rejects a valid `agent.yml` whose required boolean
+  leaf is set to `false` (e.g. `features.heartbeat.enabled: false`) with "missing
+  required field" — which blocked `./setup.sh --regenerate` for any agent that
+  disables a feature. Root cause: `_schema_get` read via `yq "$path // \"\""`, and
+  yq's `//` alternative operator collapses a present `false` to `""`, so the
+  required-leaf check saw it as absent. Now reads raw and normalizes only a literal
+  `null` to empty, so a present `false` survives while genuinely-absent/`null` leaves
+  are still flagged. Re-applies the orphaned `002-fix-schema-bool` that never reached
+  `main`.
+- **macOS bootstrap hardening** (`004-macos-bootstrap-hardening`): three image-baked
+  fixes so a from-scratch macOS (Docker Desktop / VirtioFS bind-mount) scaffold
+  reaches a fully functional agent with no manual repair, even though the container
+  already reports `healthy`. Specced with GitHub Spec Kit under
+  `specs/004-macos-bootstrap-hardening/`.
+  - **(P1)** npx-based MCP servers (`filesystem`, `vault`) now connect on macOS. The
+    Node package-runner cache is relocated off the `/home/agent` `.state` bind-mount
+    to an image path (`NPM_CONFIG_CACHE=/opt/npm-cache` + `PREFER_OFFLINE`) AND the
+    default packages are pre-warmed into it at build time — mirroring the existing uv
+    `/opt` pattern — so they no longer hit the VirtioFS small-file pathology
+    (`errno -35` / `ENOTEMPTY`) nor download inside Claude's MCP handshake window. The
+    `vault` spec is pinned so the runtime `npx` resolves the warmed version.
+  - **(P2)** After `/login`, declared plugins now install on their own. The watchdog
+    keeps retrying the post-login plugin install (non-blocking, ~120s budget) until
+    every plugin carries its `.installed-ok` sentinel, then kicks once to attach the
+    channel — instead of the single post-flip attempt that raced the auth-ready
+    moment and gave up, leaving plugins uninstalled until a manual `plugin install`.
+    On budget exhaustion it terminates and records the residual failure for
+    `agentctl doctor` (never loops unbounded).
+  - **(P3)** The GitHub MCP now runs GitHub's official `github-mcp-server` Go binary
+    (statically linked, baked into `/usr/local/bin`, invoked `github-mcp-server stdio`)
+    instead of the deprecated `@modelcontextprotocol/server-github` npx package. The
+    `GITHUB_PAT` / `GITHUB_PERSONAL_ACCESS_TOKEN` wiring is unchanged. Survives
+    `./setup.sh --regenerate`.
+
+### Added
+- **Bootstrap hardening** (`003-bootstrap-hardening`): fail-loud / validate / sync
+  fixes across the scaffold→boot→login→plugins→channel path (9 stories, 3 tiers,
+  specced with GitHub Spec Kit under `specs/003-bootstrap-hardening/`).
+  - **(A)** After `/login`, the supervisor watchdog detects the auth-credential
+    flip (appearance of `~/.claude/.credentials.json`) and **actively kicks** the
+    tmux session, so plugins install and the channel attaches with no manual
+    `docker restart` and without the operator having to `/exit`.
+  - **(B)** `setup.sh` probes the template repo visibility and warns — before
+    creating anything — when a public template would yield a public fork after a
+    private fork was requested; the operator chooses proceed-public or
+    disable-fork. Non-interactive runs default to **disable-fork** (never a
+    surprise-public fork). New `scripts/lib/fork.sh`.
+  - **(C)** Bounded plugin-install retry (3 attempts, short fixed backoff). A
+    residual failure is recorded to `.state/plugin-install-failures.jsonl` with
+    the error text truncated to its first line and token-scrubbed, and is surfaced
+    by `agentctl doctor` with a copy-paste retry command (distinct from an
+    expected "not authenticated" skip). New `docker/scripts/lib/plugin-install.sh`.
+  - **(D)** Destination paths are validated up front: a non-absolute path, a `~`
+    anywhere but position 0, and `..` are rejected; a leading `~` is expanded; a
+    `/home/…` path on macOS warns that the home dir is under `/Users/`.
+    `validate_destination_path` + `normalize_destination_path` in
+    `scripts/lib/wizard-validators.sh`.
+  - **(E)** Agent-name normalization maps spaces→hyphens, collapses consecutive
+    hyphens, and trims leading/trailing hyphens, then confirms the normalized
+    value before it is used for filenames/branches/the container name.
+  - **(F)** A host test fails when the agentic-quickstart wizard-order docs drift
+    from the canonical prompt sequence; the 6 optional catalog MCPs (aws,
+    firecrawl, google-calendar, playwright, time, tree-sitter) are now documented
+    in both locales.
+  - **(G)** Fork-less agents no longer spam a per-tick "identity backup
+    triggered" line: the watchdog skips the identity-backup hash check entirely
+    when `agent.yml` has no `scaffold.fork.url` (mirrors `heartbeatctl::_bi_run`).
+  - **(H)** The in-container CLAUDE.md refresh now preserves every pre-existing
+    `##` section header verbatim and only ADDS missing command/architecture/test
+    sections — an operator-injected section survives byte-for-byte; the prompt no
+    longer names a fixed section list. The refresh logic is now a sourceable
+    `refresh_claude_md` function (host-testable) in `docker/scripts/wizard-container.sh`.
+  - **(I)** Optional multi-line persona via `agent.yml` `agent.role_file`,
+    populated by a `--role-file PATH` wizard flag. The renderer reads the file and
+    injects it verbatim into CLAUDE.md's `## Identity` (in place of the one-line
+    role), re-reading the content on every `--regenerate`. Persona files supplied
+    from outside the workspace are copied in (`personas/<name>.md`) so they travel
+    with clone / backup / `--restore-from-fork`.
+- **Reproducible in-container dependency upgrades** (`001-deps-upgrade`). The
+  image toolchain — Claude Code, the Alpine base, `uv`, `bun`, `gum` — tracks the
+  latest stable of the moment from a single declared place that the documented
+  build honors, with no hardcoded version literals and no drift.
+  - `scripts/lib/versions.sh`: default channels (Claude Code → `stable`, others →
+    latest stable) + a best-effort upstream resolver (`versions_resolve`) with an
+    offline floor. `AGENTIC_VERSIONS_OFFLINE=1` forces the floor (offline scaffold
+    / deterministic tests).
+  - `setup.sh` resolves each channel and **records** the concrete version into
+    `agent.yml`'s `docker:` block (`claude_code_version`, `uv_version`,
+    `bun_version`, `gum_version`, `base_image`, `toolchain_channels`) at scaffold;
+    `--regenerate` backfills only missing fields (deterministic). `ensure_gum` is
+    single-sourced from `versions.sh`.
+  - `docker-compose.yml` forwards the recorded versions as `build.args`; the
+    Dockerfile is build-arg driven (`FROM ${BASE_IMAGE}`) and adds
+    `ENV UV_PYTHON_PREFERENCE=only-system` (uv ≥0.8 guard).
+  - `agentctl versions [--check] [--json] [--upgrade]`: list recorded versions +
+    channels, compare against upstream (best-effort, degrades to `unknown`
+    offline), or re-resolve non-pinned channels and record them (skips `pinned`,
+    writes `agent.yml.prev`). `agentctl doctor` gains a recorded-toolchain line.
+  - `agent.yml` schema validates `docker.toolchain_channels.*` ∈
+    {`stable`,`latest`,`pinned`} (absent = legacy-safe).
+  - Specced with GitHub Spec Kit under `specs/001-deps-upgrade/` against a new
+    project constitution (`.specify/memory/constitution.md`).
+
+### Changed
+- Bumped the baked toolchain to latest stable: Claude Code 2.1.119 → **2.1.170**
+  (`stable`), Alpine 3.20 → **3.24.1** (Node 24, Python 3.14, apk v3, busybox
+  1.37), `uv` 0.5.14 → **0.11.22**, `bun` 1.1.38 → **1.3.14**, `gum` 0.14.5 →
+  **0.17.0**.
+
+### Fixed
+- **`.state/` bind-mount guard** (`agentctl up` + `agentctl doctor`): on macOS a
+  transient Docker Desktop file-sharing glitch (or a fresh clone) could leave the
+  workspace `.state/` absent, so `docker compose up` mounted a phantom empty
+  `/home/agent` and the container booted **`healthy` over a broken bind-mount** —
+  `/login` could not persist and the vault never seeded. `agentctl up` now
+  pre-creates `.state/` (idempotent, only inside a real workspace) before composing
+  up, and `agentctl doctor` **fails** when `.state/` is missing (warns when present
+  but not writable) instead of letting the agent ghost silently.
+- `scripts/lib/wizard-gum.sh`: gum ≥0.15 changed the Esc exit code for
+  `input`/`choose` from 2 to 1; the wizard abort check is now widget-scoped so Esc
+  aborts input/choose while `gum confirm`'s legitimate "no" (rc 1) still works.
 
 ## [0.1.0] - 2026-05-06
 

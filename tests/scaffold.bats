@@ -151,7 +151,7 @@ EOF
   [ "$(yq -r '.vault.qmd.enabled' "$dest/agent.yml")" = "false" ]
   [ "$(yq -r '.vault.path' "$dest/agent.yml")" = ".state/.vault" ]
   [ "$(jq -r '.mcpServers.vault.command' "$dest/.mcp.json")" = "npx" ]
-  [ "$(jq -r '.mcpServers.vault.args[1]' "$dest/.mcp.json")" = "@bitbonsai/mcpvault@latest" ]
+  [ "$(jq -r '.mcpServers.vault.args[1]' "$dest/.mcp.json")" = "@bitbonsai/mcpvault@0.12.0" ]
   [ "$(jq -r '.mcpServers.vault.args[2]' "$dest/.mcp.json")" = "/home/agent/.vault" ]
   [ "$(jq -r '.mcpServers.qmd // "absent"' "$dest/.mcp.json")" = "absent" ]
   grep -q "Vault" "$dest/CLAUDE.md"
@@ -166,8 +166,9 @@ EOF
   [ -f "$dest/agent.yml" ]
   [ "$(yq -r '.vault.enabled' "$dest/agent.yml")" = "true" ]
   [ "$(yq -r '.vault.qmd.enabled' "$dest/agent.yml")" = "true" ]
+  [ "$(yq -r '.vault.qmd.version' "$dest/agent.yml")" = "2.5.3" ]
   [ "$(jq -r '.mcpServers.qmd.command' "$dest/.mcp.json")" = "bunx" ]
-  [ "$(jq -r '.mcpServers.qmd.args[0]' "$dest/.mcp.json")" = "@tobilu/qmd@latest" ]
+  [ "$(jq -r '.mcpServers.qmd.args[0]' "$dest/.mcp.json")" = "@tobilu/qmd@2.5.3" ]
   [ "$(jq -r '.mcpServers.qmd.args[1]' "$dest/.mcp.json")" = "mcp" ]
 }
 

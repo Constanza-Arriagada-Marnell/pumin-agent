@@ -42,6 +42,37 @@ run_docker_wizard() {
   [ "$(yq '.docker.gid' "$dest/agent.yml")" = "$(id -g)" ]
 }
 
+@test "wizard resolves and records toolchain versions into agent.yml + compose" {
+  mkdir -p "$TMP_TEST_DIR/installer"
+  local dest="$TMP_TEST_DIR/docker-versions"
+  run run_docker_wizard "$dest"
+  [ "$status" -eq 0 ]
+  # Suite runs offline (helper.bash) → resolver records the documented floor
+  # (the latest-stable values).
+  [ "$(yq -r '.docker.claude_code_version' "$dest/agent.yml")" = "2.1.170" ]
+  [ "$(yq -r '.docker.uv_version' "$dest/agent.yml")" = "0.11.22" ]
+  [ "$(yq -r '.docker.bun_version' "$dest/agent.yml")" = "1.3.14" ]
+  [ "$(yq -r '.docker.gum_version' "$dest/agent.yml")" = "0.17.0" ]
+  [ "$(yq -r '.docker.base_image' "$dest/agent.yml")" = "alpine:3.24.1" ]
+  # ...and they flow through into the compose build args.
+  grep -q 'CLAUDE_CODE_VERSION: "2.1.170"' "$dest/docker-compose.yml"
+  grep -q 'BASE_IMAGE: "alpine:3.24.1"' "$dest/docker-compose.yml"
+}
+
+@test "--regenerate backfills missing toolchain versions for a legacy agent.yml" {
+  mkdir -p "$TMP_TEST_DIR/installer"
+  local dest="$TMP_TEST_DIR/docker-backfill"
+  run run_docker_wizard "$dest"
+  [ "$status" -eq 0 ]
+  # Simulate a legacy agent.yml predating this feature (no version field).
+  yq -i 'del(.docker.claude_code_version)' "$dest/agent.yml"
+  [ "$(yq -r '.docker.claude_code_version // "MISSING"' "$dest/agent.yml")" = "MISSING" ]
+  cd "$dest"
+  run ./setup.sh --regenerate
+  [ "$status" -eq 0 ]
+  [ "$(yq -r '.docker.claude_code_version' "$dest/agent.yml")" = "2.1.170" ]
+}
+
 @test "--docker scaffold copies docker/ directory into destination" {
   mkdir -p "$TMP_TEST_DIR/installer"
   local dest="$TMP_TEST_DIR/docker-scaffold"
@@ -52,6 +83,21 @@ run_docker_wizard() {
   [ -f "$dest/docker/entrypoint.sh" ]
   [ -x "$dest/docker/entrypoint.sh" ]
   [ -f "$dest/docker/scripts/start_services.sh" ]
+}
+
+@test "Dockerfile COPYs plugin-install.sh so the bounded-retry lib ships in the image" {
+  # US3 (008-fix-postlogin-plugin-install): docker/scripts/lib/plugin-install.sh
+  # (defines retry_plugin_install_bounded) is image-only and reaches the build
+  # context via the wholesale docker/ copy, but the Dockerfile must COPY it into
+  # the image or the supervisor falls back to the legacy single-attempt path.
+  grep -qE '^COPY[[:space:]]+scripts/lib/plugin-install\.sh[[:space:]]+/opt/agent-admin/scripts/lib/plugin-install\.sh' \
+    "$REPO_ROOT/docker/Dockerfile"
+  # And the lib must be present in the scaffolded build context.
+  mkdir -p "$TMP_TEST_DIR/installer"
+  local dest="$TMP_TEST_DIR/docker-plugin-install"
+  run run_docker_wizard "$dest"
+  [ "$status" -eq 0 ]
+  [ -f "$dest/docker/scripts/lib/plugin-install.sh" ]
 }
 
 @test "--docker scaffold writes docker-compose.yml at workspace root" {

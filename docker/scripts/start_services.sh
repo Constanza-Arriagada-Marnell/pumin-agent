@@ -29,12 +29,33 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [start_services] $*" >&2; }
 [ -f /opt/agent-admin/scripts/lib/vault.sh ] \
   && source /opt/agent-admin/scripts/lib/vault.sh
 
+# QMD self-managing RAG helpers (010, image-baked). Provides
+# qmd_setup_if_needed, qmd_reindex, _qmd_enabled, qmd_vault_dir. Sources
+# backup_vault.sh internally. Image path first; repo-relative fallback so host
+# bats tests that source this script get the qmd_* helpers too.
+# shellcheck source=/dev/null
+if [ -f /opt/agent-admin/scripts/lib/qmd_index.sh ]; then
+  source /opt/agent-admin/scripts/lib/qmd_index.sh
+elif [ -f "$(dirname "${BASH_SOURCE[0]}")/lib/qmd_index.sh" ]; then
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/qmd_index.sh"
+fi
+
 # Backup-identity helpers (image-baked). Provides identity_whitelist,
 # identity_hash, identity_prepare_clone, identity_commit_and_push,
 # identity_write_state. Sourced no-op if missing.
 # shellcheck source=/dev/null
 [ -f /opt/agent-admin/scripts/lib/backup_identity.sh ] \
   && source /opt/agent-admin/scripts/lib/backup_identity.sh
+
+# Plugin-install retry + failure tracking (Story C). Image path first; fall
+# back to the repo-relative path so host bats tests that source this script get
+# retry_plugin_install_bounded / _plugin_*_failure too.
+# shellcheck source=/dev/null
+if [ -f /opt/agent-admin/scripts/lib/plugin-install.sh ]; then
+  source /opt/agent-admin/scripts/lib/plugin-install.sh
+elif [ -f "$(dirname "${BASH_SOURCE[0]}")/lib/plugin-install.sh" ]; then
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/plugin-install.sh"
+fi
 
 # seed_vault_if_needed — at first boot, copy the skeleton into the per-agent
 # vault dir if vault.enabled + vault.seed_skeleton and the target is empty.
@@ -128,6 +149,65 @@ boot_side_effects() {
 
   # Seed the per-agent vault if configured. Idempotent — no-op once seeded.
   seed_vault_if_needed || log "WARN: seed_vault_if_needed failed (non-fatal)"
+
+  # Self-managing RAG (010): first-boot QMD model download + initial index.
+  # Run in the BACKGROUND so the ~300MB download never delays the watchdog
+  # (Principle IV). Each bunx call inside is timeout-bounded; the whole thing
+  # is idempotent (sentinel + index.sqlite) and fail-silent. Only dispatched
+  # when vault.qmd.enabled — zero overhead otherwise.
+  if command -v qmd_setup_if_needed >/dev/null 2>&1 \
+      && command -v _qmd_enabled >/dev/null 2>&1 \
+      && _qmd_enabled /workspace/agent.yml; then
+    ( qmd_setup_if_needed /workspace/agent.yml ) &
+    log "qmd: first-boot setup dispatched (background)"
+  fi
+}
+
+# ── QMD watcher lifecycle (010) ───────────────────────────
+# The inotify watcher (qmd_watch.sh) gives immediate reindex on vault change;
+# the */5 cron line is the backstop. Started at boot when vault.qmd.enabled and
+# respawned by the watchdog poll on a DETERMINISTIC PID-liveness check (NOT the
+# reverted heuristic bridge watchdog — this is just "is the process alive?").
+QMD_WATCH_SCRIPT="${QMD_WATCH_SCRIPT:-/opt/agent-admin/scripts/qmd_watch.sh}"
+
+# Resolve the watcher pidfile LAZILY so it derives from a single source of truth:
+# honor an explicit override (host bats), else build it from WATCHDOG_RUNTIME_DIR
+# — which is assigned in the Config section *below*, so this must run at call-time
+# (after Config), never at source-time. The ${VAR:-...} guard keeps it set -u-safe
+# when the script is merely sourced (host bats) before Config runs.
+_qmd_watch_pidfile() {
+  printf '%s\n' "${QMD_WATCH_PIDFILE:-${WATCHDOG_RUNTIME_DIR:-/tmp/agent-watchdog}/qmd-watch.pid}"
+}
+
+qmd_watch_enabled() {
+  command -v _qmd_enabled >/dev/null 2>&1 || return 1
+  _qmd_enabled /workspace/agent.yml
+}
+
+qmd_watch_alive() {
+  local pidfile pid
+  pidfile=$(_qmd_watch_pidfile)
+  [ -f "$pidfile" ] || return 1
+  pid=$(cat "$pidfile" 2>/dev/null)
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+qmd_watch_start() {
+  qmd_watch_enabled || return 0
+  [ -f "$QMD_WATCH_SCRIPT" ] || { log "qmd watcher script missing: $QMD_WATCH_SCRIPT"; return 0; }
+  local pidfile; pidfile=$(_qmd_watch_pidfile)
+  mkdir -p "$(dirname "$pidfile")" 2>/dev/null || true
+  bash "$QMD_WATCH_SCRIPT" >/dev/null 2>&1 &
+  echo $! > "$pidfile"
+  log "qmd watcher started (pid $(cat "$pidfile" 2>/dev/null))"
+}
+
+# Respawn the watcher if enabled and its PID is dead. Called once per 2s poll.
+qmd_watch_respawn_if_needed() {
+  qmd_watch_enabled || return 0
+  qmd_watch_alive && return 0
+  log "qmd watcher not alive — (re)starting"
+  qmd_watch_start
 }
 
 # ── 2. Config ─────────────────────────────────────────────
@@ -135,6 +215,12 @@ SESSION="agent"
 WORKDIR="/workspace"
 CLAUDE_CONFIG_DIR_VAL="/home/agent/.claude"
 REQUIRED_CHANNEL_PLUGIN="telegram@claude-plugins-official"
+# Official Claude plugin marketplace — single-sourced so ensure_official_marketplace
+# (registration) and plugin_cache_dir_for (cache key) agree on the name. Headless
+# token auth skips the interactive onboarding that used to seed it, so the
+# supervisor registers it explicitly at boot.
+OFFICIAL_MARKETPLACE_NAME="claude-plugins-official"
+OFFICIAL_MARKETPLACE_SOURCE="anthropics/claude-plugins-official"
 
 # Watchdog runtime state — lives on tmpfs (/tmp) so it resets every
 # container start. CHANNEL_MARKER is touched by start_session after a
@@ -150,6 +236,13 @@ WINDOW=300
 # crash_budget_check (defined below) drops entries older than now-WINDOW
 # and exits the watchdog when MAX_CRASHES still fit in the trailing window.
 CRASH_TIMES=""
+
+# Post-login plugin-install budget (feature 004/US2). After the /login
+# credential flip the watchdog keeps retrying plugin install each tick until
+# every plugin carries its .installed-ok sentinel OR this many seconds elapse —
+# instead of the single post-flip attempt that races the auth-ready moment and
+# gives up. Overridable (small value in tests).
+PLUGIN_POSTLOGIN_BUDGET="${PLUGIN_POSTLOGIN_BUDGET:-120}"
 
 # ── 3. Plugin auto-install ────────────────────────────────
 # `claude plugin install` requires an authenticated profile. On first boot
@@ -176,6 +269,7 @@ ensure_plugin_installed_one() {
   if [ -d "$cache" ] && [ -f "$cache/.installed-ok" ]; then
     apply_plugin_post_hooks "$spec" "$cache"
     _trigger_identity_backup "post-plugin-check"
+    if command -v _plugin_clear_failure >/dev/null 2>&1; then _plugin_clear_failure "$spec"; fi
     return 0
   fi
   if [ -d "$cache" ]; then
@@ -183,6 +277,26 @@ ensure_plugin_installed_one() {
     rm -rf "$cache"
   fi
   log "attempting to install plugin: $spec"
+
+  # Story C: bounded retry + distinct not-auth/failed outcomes + a sanitized
+  # residual-failure record surfaced by `agentctl doctor` and NEXT_STEPS. Falls
+  # back to the legacy single-attempt path when the lib isn't sourced.
+  if command -v retry_plugin_install_bounded >/dev/null 2>&1; then
+    local reason rc
+    reason=$(retry_plugin_install_bounded "$spec") && rc=0 || rc=$?
+    case "$rc" in
+      0)
+        [ -d "$cache" ] && : > "$cache/.installed-ok"
+        apply_plugin_post_hooks "$spec" "$cache"
+        _trigger_identity_backup "post-plugin-install"
+        _plugin_clear_failure "$spec"
+        return 0 ;;
+      2) return 1 ;;                                   # not authenticated — expected skip
+      *) _plugin_record_failure "$spec" "$reason"; return 1 ;;
+    esac
+  fi
+
+  # Legacy fallback (plugin-install lib unavailable).
   if CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR_VAL" claude plugin install "$spec" >/dev/null 2>&1; then
     log "plugin installed: $spec"
     [ -d "$cache" ] && : > "$cache/.installed-ok"
@@ -326,6 +440,14 @@ has_telegram_token() {
   [ -n "$val" ]
 }
 
+# Whether the container env carries a non-empty CLAUDE_CODE_OAUTH_TOKEN (from
+# `claude setup-token`, delivered via docker-compose env_file). When present,
+# claude authenticates from the environment, so the supervisor must not fall
+# back to the bare-claude /login path. NEVER echo the value (secret hygiene).
+has_oauth_token() {
+  [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]
+}
+
 # Pre-configure the user's Claude settings for headless operation:
 #   - skipDangerousModePermissionPrompt=true — dismiss the one-time
 #     `--dangerously-skip-permissions` warning dialog so the first launch
@@ -343,7 +465,13 @@ has_telegram_token() {
 # once here covers both launch paths.
 pre_accept_bypass_permissions() {
   local settings="$HOME/.claude/settings.json"
-  [ -f "$settings" ] || return 0
+  # Create settings.json if absent so the headless defaults apply on first boot —
+  # the bind-mount config dir may have no settings yet before claude's first run
+  # (previously this early-returned and never seeded on a fresh agent).
+  if [ ! -f "$settings" ]; then
+    mkdir -p "$(dirname "$settings")" 2>/dev/null || true
+    echo '{}' > "$settings" 2>/dev/null || return 0
+  fi
   local need_skip need_mode
   need_skip=$(jq -r '.skipDangerousModePermissionPrompt // false' "$settings" 2>/dev/null || echo "false")
   need_mode=$(jq -r '.permissions.defaultMode // ""' "$settings" 2>/dev/null || echo "")
@@ -360,6 +488,32 @@ pre_accept_bypass_permissions() {
     mv "$tmp" "$settings"
   else
     rm -f "$tmp"
+  fi
+}
+
+# pre_seed_onboarding — pre-populate ~/.claude/.claude.json so the first-run
+# onboarding (theme picker + per-project trust dialog) doesn't block the headless
+# tmux session. These keys live in .claude.json, NOT settings.json (adding them
+# to settings.json trips a schema error). Creates the file if absent; idempotent
+# jq-merge that preserves an existing theme; fail-silent — never block boot.
+pre_seed_onboarding() {
+  command -v jq >/dev/null 2>&1 || return 0
+  local cfg="${CLAUDE_CONFIG_DIR_VAL}/.claude.json"
+  local workdir="${WORKDIR:-/workspace}"
+  mkdir -p "$(dirname "$cfg")" 2>/dev/null || true
+  [ -f "$cfg" ] || echo '{}' > "$cfg" 2>/dev/null || return 0
+  local tmp
+  tmp=$(mktemp) || return 0
+  if jq --arg wd "$workdir" '
+        .hasCompletedOnboarding = true
+        | .theme = (.theme // "dark")
+        | .projects = ((.projects // {}) | .[$wd] = ((.[$wd] // {}) + {hasTrustDialogAccepted: true}))
+      ' "$cfg" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$cfg"
+    chmod 0644 "$cfg" 2>/dev/null || true
+  else
+    rm -f "$tmp"
+    log "WARN: failed to pre-seed onboarding in $cfg"
   fi
 }
 
@@ -396,6 +550,88 @@ pre_accept_extra_marketplaces() {
   fi
 }
 
+# ensure_official_marketplace — register the official Claude plugin marketplace
+# so @claude-plugins-official plugins (incl. the channel) can install. Headless
+# token auth skips the interactive onboarding that used to seed it. Idempotent
+# (guarded by `marketplace list`) and fail-silent: a slow/failed git clone over
+# the VirtioFS bind-mount must never block or crash the watchdog tick.
+ensure_official_marketplace() {
+  command -v claude >/dev/null 2>&1 || return 0
+  # Bound each claude call so a wedged CLI can't block the boot path before the
+  # watchdog starts (Principle IV: degrade gracefully, never hang the
+  # supervisor). `timeout` ships in the Alpine image (busybox); if it's somehow
+  # absent we degrade to a direct call rather than break the boot. Configurable
+  # via MARKETPLACE_CMD_TIMEOUT for tests.
+  local _to=""
+  if command -v timeout >/dev/null 2>&1; then
+    _to="timeout ${MARKETPLACE_CMD_TIMEOUT:-12}"
+  fi
+  # shellcheck disable=SC2086  # $_to must word-split into `timeout N` (or empty)
+  if CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR_VAL" $_to claude plugin marketplace list 2>/dev/null \
+       | grep -q "$OFFICIAL_MARKETPLACE_NAME"; then
+    return 0   # already registered
+  fi
+  log "registering official marketplace: $OFFICIAL_MARKETPLACE_SOURCE"
+  # shellcheck disable=SC2086  # $_to must word-split into `timeout N` (or empty)
+  if CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR_VAL" \
+       $_to claude plugin marketplace add "$OFFICIAL_MARKETPLACE_SOURCE" --scope user >/dev/null 2>&1; then
+    log "official marketplace registered: $OFFICIAL_MARKETPLACE_NAME"
+  else
+    log "WARN: official marketplace registration failed or timed out (will retry next tick)"
+  fi
+  return 0
+}
+
+# ensure_extra_marketplaces — RESOLVE every third-party marketplace declared by
+# the agent's plugins so their plugins install. The official marketplace is
+# registered with `marketplace add` AND confirmed (ensure_official_marketplace),
+# but pre_accept_extra_marketplaces only merges third-party sources into
+# settings.json's extraKnownMarketplaces — no `add`, no confirm — so the
+# immediate `claude plugin install foo@thirdparty` errored "marketplace not
+# found", retry_plugin_install_bounded returned 2 (skip, no retry), and since the
+# steady-state tmux session never respawns the plugin stayed permanently absent.
+# Mirror of ensure_official_marketplace: idempotent (guarded by `marketplace
+# list`), each claude call bounded by `timeout` (degrade to a direct call if
+# absent — busybox ships it, macOS host may not), fail-silent (always return 0;
+# a slow git clone over VirtioFS must never hang the boot before the watchdog).
+ensure_extra_marketplaces() {
+  command -v claude >/dev/null 2>&1 || return 0
+  command -v plugin_catalog_specs >/dev/null 2>&1 || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local specs mkts_json
+  specs=$(plugin_catalog_specs /workspace/agent.yml | tr '\n' ' ')
+  [ -z "${specs// /}" ] && return 0
+  # shellcheck disable=SC2086  # specs must word-split into separate args
+  mkts_json=$(plugin_catalog_marketplaces_json $specs)
+  { [ -z "$mkts_json" ] || [ "$mkts_json" = "{}" ]; } && return 0
+
+  local _to=""
+  if command -v timeout >/dev/null 2>&1; then
+    _to="timeout ${MARKETPLACE_CMD_TIMEOUT:-12}"
+  fi
+
+  local key repo
+  while IFS= read -r key; do
+    [ -z "$key" ] && continue
+    repo=$(printf '%s' "$mkts_json" | jq -r --arg k "$key" '.[$k].source.repo // ""')
+    [ -z "$repo" ] && continue
+    # shellcheck disable=SC2086  # $_to must word-split into `timeout N` (or empty)
+    if CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR_VAL" $_to claude plugin marketplace list 2>/dev/null \
+         | grep -q "$key"; then
+      continue   # already resolved
+    fi
+    log "registering extra marketplace: $repo"
+    # shellcheck disable=SC2086  # $_to must word-split into `timeout N` (or empty)
+    if CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR_VAL" \
+         $_to claude plugin marketplace add "$repo" --scope user >/dev/null 2>&1; then
+      log "extra marketplace registered: $key"
+    else
+      log "WARN: extra marketplace $key registration failed or timed out (will retry next tick)"
+    fi
+  done < <(printf '%s' "$mkts_json" | jq -r 'keys[]')
+  return 0
+}
+
 # Build the next tmux command based on current state. Three cases:
 #   A. Not authenticated → bare `claude` so the user can `/login`.
 #   B. Authenticated, no Telegram bot token yet → interactive wizard to
@@ -410,11 +646,16 @@ next_tmux_cmd() {
   # install needs auth), but on subsequent respawns it picks up the
   # full catalog (5 defaults + any opt-ins the user selected at scaffold).
   pre_accept_extra_marketplaces
+  ensure_extra_marketplaces
+  ensure_official_marketplace
   ensure_all_plugins_installed
 
-  if ! _channel_plugin_ready; then
-    # Case A: channel plugin not yet usable (no /login, or install failed).
-    # Fall back to bare claude so the user can authenticate.
+  if ! _channel_plugin_ready && ! has_oauth_token; then
+    # Case A: channel plugin not yet usable (no /login, or install failed) AND
+    # no headless token. Fall back to bare claude so the user can /login.
+    # With CLAUDE_CODE_OAUTH_TOKEN present, claude is already authenticated, so
+    # we never park at a /login prompt — drop through to Case B/C and let
+    # ensure_all_plugins_installed keep retrying on subsequent respawns.
     echo "$base"
     return
   fi
@@ -483,6 +724,7 @@ start_session() {
   # that ends up passing --dangerously-skip-permissions boots cleanly,
   # regardless of which case next_tmux_cmd picked.
   pre_accept_bypass_permissions
+  pre_seed_onboarding
 
   local cmd
   cmd=$(next_tmux_cmd)
@@ -723,6 +965,18 @@ _check_auth_banner() {
   fi
 }
 
+# _identity_backup_fork_configured → 0 if agent.yml carries a scaffold.fork.url
+# (a backup target exists), non-zero otherwise. Mirrors heartbeatctl::_bi_run's
+# fork-presence guard so a fork-less agent never attempts a backup. The
+# agent.yml path is overridable for host tests (cf. AUTH_BANNER_AGENT_YML_OVERRIDE).
+_identity_backup_fork_configured() {
+  local agent_yml="${IDENTITY_BACKUP_AGENT_YML_OVERRIDE:-/workspace/agent.yml}"
+  local fork_url
+  fork_url=$(yq '.scaffold.fork.url // ""' "$agent_yml" 2>/dev/null)
+  [ "$fork_url" = "null" ] && fork_url=""
+  [ -n "$fork_url" ]
+}
+
 # Backup-identity: every 60s, compare identity hash vs last-backup hash.
 # Fires the primitive when they differ. Throttled to avoid bursts.
 _last_backup_check=0
@@ -733,6 +987,11 @@ _check_identity_backup() {
     return 0
   fi
   _last_backup_check=$now
+
+  # Fork-less agents have nowhere to back up to — skip the hash check and the
+  # per-tick trigger entirely so the supervisor log stays quiet (FR-G1). This
+  # must come before any hashing or _trigger_identity_backup call.
+  _identity_backup_fork_configured || return 0
 
   if [ -f /opt/agent-admin/scripts/lib/backup_identity.sh ]; then
     # shellcheck source=/dev/null
@@ -757,11 +1016,108 @@ _check_identity_backup() {
   fi
 }
 
+# ── Auth-flip detection (Story A) ─────────────────────────
+# After /login, claude writes the OAuth credential file. In the bare-claude
+# (Case A) state the session is alive and channel_plugin_alive returns OK
+# (no channel marker), so the watchdog `continue`s forever and never respawns
+# — meaning the post-login plugin install + --channels attach never happen
+# unless the operator manually /exits. This detects the absent->present
+# credential flip and kicks the session so the watchdog respawns it (which
+# re-runs ensure_all_plugins_installed + re-decides next_tmux_cmd). File
+# existence only — NO tmux-pane scraping (CLAUDE.md forbids it).
+_auth_marker_file() {
+  echo "${AUTH_MARKER_OVERRIDE:-$CLAUDE_CONFIG_DIR_VAL/.credentials.json}"
+}
+
+# -1 = baseline not yet established; the first tick only records state so an
+# agent that boots already-authenticated is never needlessly kicked.
+_prev_auth_present=-1
+# Post-login plugin-install retry deadline (unix ts). 0 = not armed. Armed by
+# _check_auth_flip on the credential flip; cleared by _post_login_plugin_retry
+# on completion or budget exhaustion.
+_post_login_deadline=0
+_check_auth_flip() {
+  # Env-token auth (CLAUDE_CODE_OAUTH_TOKEN) writes no .credentials.json, so the
+  # agent is already authenticated at baseline — pin _prev_auth_present so the
+  # absent->present file flip can never fire a spurious kill-session.
+  if has_oauth_token; then _prev_auth_present=1; return 0; fi
+  local present=0
+  if [ -f "$(_auth_marker_file)" ]; then present=1; fi
+
+  if [ "$_prev_auth_present" -eq -1 ]; then
+    _prev_auth_present=$present
+    return 0
+  fi
+
+  if [ "$_prev_auth_present" -eq 0 ] && [ "$present" -eq 1 ]; then
+    log "auth credential appeared (/login complete) — kicking session to install plugins + attach channel"
+    # Arm the post-login retry budget so the watchdog keeps trying the install
+    # past this single kick until the profile is operative (FR-003/FR-005).
+    _post_login_deadline=$(( $(date +%s) + PLUGIN_POSTLOGIN_BUDGET ))
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+  fi
+  _prev_auth_present=$present
+}
+
+# _all_plugins_installed — 0 only when every catalog plugin carries its
+# .installed-ok sentinel. Drives _post_login_plugin_retry's completion check.
+# Falls back to the required channel plugin's readiness when the catalog lib
+# isn't loaded (host tests / minimal images).
+_all_plugins_installed() {
+  if command -v plugin_catalog_specs >/dev/null 2>&1; then
+    local spec cache
+    while IFS= read -r spec; do
+      [ -z "$spec" ] && continue
+      cache=$(plugin_cache_dir_for "$spec")
+      { [ -d "$cache" ] && [ -f "$cache/.installed-ok" ]; } || return 1
+    done < <(plugin_catalog_specs /workspace/agent.yml)
+    return 0
+  fi
+  _channel_plugin_ready
+}
+
+# _post_login_plugin_retry — non-blocking, tick-based post-login install retry
+# (feature 004/US2). Called once per watchdog tick. While the deadline is armed
+# and not every plugin is installed, it re-runs the idempotent install (each
+# attempt returns in ~1s, so the 2s poll is not starved). On completion it kicks
+# the session exactly once (so the respawn attaches --channels) and clears the
+# deadline; on budget exhaustion it clears the deadline WITHOUT re-kicking
+# (residual failures were already recorded by ensure_plugin_installed_one for
+# `agentctl doctor`). No per-tick re-kick → the crash budget (5/300s) is safe.
+_post_login_plugin_retry() {
+  [ "${_post_login_deadline:-0}" -eq 0 ] && return 0
+
+  if _all_plugins_installed; then
+    log "post-login: all plugins installed — kicking session once to attach --channels"
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    _post_login_deadline=0
+    return 0
+  fi
+
+  local now
+  now=$(date +%s)
+  if [ "$now" -ge "$_post_login_deadline" ]; then
+    log "post-login: plugin-install budget (${PLUGIN_POSTLOGIN_BUDGET}s) exhausted — residual failures left for agentctl doctor"
+    _post_login_deadline=0
+    return 0
+  fi
+
+  ensure_all_plugins_installed || true
+  return 0
+}
+
 # ── 6. Watchdog ───────────────────────────────────────────
 # Poll every 2s so the re-attach gap between Claude dying (/exit) and the
 # next tmux session coming up is barely noticeable. Cheap check — just
 # `tmux has-session`.
 _run_watchdog() {
+  # Resolve QMD enablement ONCE at boot: enabling/disabling requires a
+  # --regenerate + container restart anyway, and this keeps the per-tick poll
+  # at literally zero extra work for QMD-disabled agents (FR-012 / SC-007).
+  local qmd_on=0
+  if command -v _qmd_enabled >/dev/null 2>&1 && _qmd_enabled /workspace/agent.yml; then
+    qmd_on=1
+  fi
   while true; do
     sleep 2
     if ! pgrep -x crond >/dev/null 2>&1; then
@@ -777,6 +1133,24 @@ _run_watchdog() {
     # emits a warning via the configured notifier — orthogonal to the
     # heartbeat-based detection (which has up to 30 min latency).
     _check_auth_banner
+
+    # Story A: detect the unauthenticated->authenticated credential flip
+    # (operator completed /login) and kick the session so the watchdog
+    # respawns it — installing plugins + attaching --channels without a
+    # manual /exit or restart. File-existence only; no tmux-pane scraping.
+    _check_auth_flip
+
+    # Feature 004/US2: keep retrying the post-login plugin install (bounded by
+    # PLUGIN_POSTLOGIN_BUDGET) until every plugin carries .installed-ok, then
+    # kick once so the respawn attaches --channels. Non-blocking (one pass per
+    # tick); no per-tick re-kick, so the crash budget stays untouched.
+    _post_login_plugin_retry
+
+    # 010: respawn the QMD inotify watcher if it died (deterministic PID
+    # liveness). Gated on the boot-time qmd_on flag so disabled agents do zero
+    # per-tick work. Independent of the tmux session — does NOT touch the crash
+    # budget.
+    [ "$qmd_on" -eq 1 ] && qmd_watch_respawn_if_needed
 
     if session_alive && channel_plugin_alive; then
       continue
@@ -810,6 +1184,9 @@ main() {
     log "ERROR: initial tmux session failed to start"
     exit 1
   fi
+
+  # Start the QMD inotify watcher (no-op unless vault.qmd.enabled).
+  qmd_watch_start
 
   _run_watchdog
 }

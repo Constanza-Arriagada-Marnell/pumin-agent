@@ -20,9 +20,29 @@ The container starts and the supervisor launches Claude Code inside a detached t
 
 Detach without killing the container: `Ctrl-b d` (standard tmux binding).
 
-## 2. Log in to Claude (one-time)
+## 2. Authenticate Claude (one-time)
 
-Inside the tmux session:
+### Headless token (recommended)
+
+On macOS the interactive `/login` credential does not persist — VirtioFS cache
+incoherence on the `~/.claude` bind-mount drops it, so Claude reverts to
+"Not logged in" on every boot. Use a long-lived token instead: generate it once
+on the **host** and put it in `.env` BEFORE `docker compose up`.
+
+```bash
+claude setup-token            # on the HOST; authorize OAuth, paste the code IN THE TERMINAL
+#   → it prints a long-lived token: sk-ant-oat01-…
+$EDITOR {{DEPLOYMENT_WORKSPACE}}/.env   # set CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-…
+docker compose up -d          # the agent boots already authenticated — no /login
+```
+
+The token lives only in `.env` (0600, gitignored) — never in `agent.yml`. With
+identity backup in partial mode (no SSH recipient) the `.env` is backed up in
+plaintext to the fork, so prefer a configured recipient when using a token.
+
+### Interactive /login (fallback)
+
+If you skip the token, log in inside the tmux session:
 
 1. Pick a theme (Enter accepts the default) and confirm trust on `/workspace`.
 2. Run `/login`, open the URL in your browser, authorize, paste the code back. Credentials land in `{{DEPLOYMENT_WORKSPACE}}/.state/` (bind-mounted to the container's `/home/agent`) and survive rebuilds.
@@ -145,7 +165,7 @@ Before anything else:
 ./scripts/agentctl doctor
 ```
 
-Runs 12 checks in dependency order (Docker daemon → container → health → agent.yml → tmux → crond → Telegram plugin → heartbeat → vault → patches) and reports `✓` / `⚠` / `✗` per subsystem with an actionable hint when something fails. The fastest way to know what's broken without running 8 commands.
+Runs 12 checks in dependency order (Docker daemon → container → health → agent.yml → tmux → crond → Telegram plugin → heartbeat → vault → patches) and reports `✓` / `⚠` / `✗` per subsystem with an actionable hint when something fails. The fastest way to know what's broken without running 8 commands. It also lists any plugin the supervisor failed to install, each with a copy-paste retry command.
 
 ### The agent stops responding on Telegram ("ghosting")
 
@@ -209,7 +229,7 @@ Two distinct causes, both handled by `agentctl attach` instead of the raw comman
 
 Two usual causes:
 
-1. **Plugin not installed yet** — on first boot claude launches with `--channels` but the plugin cache isn't populated. Run `docker compose restart` after `/login` so the watchdog installs the plugin and re-launches. Inside tmux, `/mcp` shows each server's status: look for `✔ connected`.
+1. **Plugin not installed yet** — on first boot claude launches before `/login`, so plugins can't install. After you `/login`, the watchdog detects it and auto-installs the plugins + re-launches with `--channels` — no manual restart needed. Inside tmux, `/mcp` shows each server's status: look for `✔ connected`. If one stays failed, `agentctl doctor` lists it with a retry command.
 2. **`bun` missing from the image** — the plugin MCP server runs on bun. The launcher's image installs it; if you built a custom image without bun, confirm:
 
 ```bash
