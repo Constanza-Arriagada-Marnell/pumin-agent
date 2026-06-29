@@ -51,6 +51,11 @@ _SCHEMA_REQUIRED_LEAVES=(
 # polices the *value* once it's populated.
 _SCHEMA_ENUMS=(
   '.notifications.channel=none,log,telegram'
+  '.docker.toolchain_channels.claude_code=stable,latest,pinned'
+  '.docker.toolchain_channels.alpine=stable,latest,pinned'
+  '.docker.toolchain_channels.uv=stable,latest,pinned'
+  '.docker.toolchain_channels.bun=stable,latest,pinned'
+  '.docker.toolchain_channels.gum=stable,latest,pinned'
 )
 
 # Boolean fields. Same idea as enums but specifically restricted to
@@ -58,13 +63,29 @@ _SCHEMA_ENUMS=(
 # (yq parses "yes" as a string in YAML 1.2 mode).
 _SCHEMA_BOOLEANS=(
   '.features.heartbeat.enabled'
+  '.vault.qmd.enabled'
 )
 
-# Internal: read a yq value, normalise null/empty to empty string.
+# Optional string leaves: absent is fine (not required), but if the key is
+# present it must be a non-empty string. yq prints "null" for an absent path,
+# so we can tell "absent" (skip) from "present but empty" (error). role_file
+# (Story I) is the first such leaf — its on-disk existence is checked later by
+# render.sh, here we only guard the YAML shape.
+_SCHEMA_OPTIONAL_NONEMPTY=(
+  '.agent.role_file'
+  '.vault.qmd.version'
+  '.vault.qmd.schedule'
+)
+
+# Internal: read a yq value, normalise a missing (null) value to empty string.
+# Read raw — NOT via `path // ""`, whose yq alternative operator collapses a
+# present boolean `false` to "" (making a required `enabled: false` look
+# missing). The explicit null check below handles the absent case; a present
+# `false` survives as the string "false".
 _schema_get() {
   local file="$1" path="$2"
   local val
-  val=$(yq -r "$path // \"\"" "$file" 2>/dev/null)
+  val=$(yq -r "$path" "$file" 2>/dev/null)
   [ "$val" = "null" ] && val=""
   printf '%s' "$val"
 }
@@ -117,6 +138,22 @@ agent_yml_validate() {
       true|false) ;;
       *)          errors+=("${bool_path} must be a YAML boolean (true|false), got: ${val}") ;;
     esac
+  done
+
+  # Optional non-empty strings: read raw (not via _schema_get, whose `// ""`
+  # collapses absent and empty). yq prints "null" for an absent path, so we
+  # only flag a key that is present yet empty.
+  #
+  # NOTE: vault.qmd.version is intentionally NOT required-when-enabled here. A
+  # pre-010 workspace that opted into QMD has enabled=true and no version key;
+  # the contract (contracts/agent-yml-schema.md) mandates a GRACEFUL fallback to
+  # 2.5.3 on --regenerate (setup.sh backfills it into agent.yml), not a hard
+  # validation failure that would block the zero-touch upgrade path.
+  local opt_path opt_val
+  for opt_path in "${_SCHEMA_OPTIONAL_NONEMPTY[@]}"; do
+    opt_val=$(yq -r "$opt_path" "$file" 2>/dev/null)
+    [ "$opt_val" = "null" ] && continue
+    [ -z "$opt_val" ] && errors+=("${opt_path}, if set, must be a non-empty string")
   done
 
   if [ ${#errors[@]} -gt 0 ]; then

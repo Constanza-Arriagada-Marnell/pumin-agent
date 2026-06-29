@@ -1,5 +1,9 @@
 # syntax=docker/dockerfile:1.6
-FROM alpine:3.20
+# Base image — overridable via build arg (recorded in agent.yml docker.base_image
+# and passed through by docker-compose). Default tracks the latest stable Alpine;
+# keep in sync with scripts/lib/versions.sh (a bats drift-guard enforces it).
+ARG BASE_IMAGE=alpine:3.24.1
+FROM ${BASE_IMAGE}
 
 ARG UID=1000
 ARG GID=1000
@@ -39,10 +43,11 @@ RUN apk add --no-cache \
       python3 \
       age \
       flock \
+      inotify-tools \
       tzdata
 
 # Install gum from the charmbracelet tap alternative: use the static binary.
-ARG GUM_VERSION=0.14.5
+ARG GUM_VERSION=0.17.0
 RUN set -eux; \
     arch=$(uname -m); \
     case "$arch" in \
@@ -59,7 +64,7 @@ RUN set -eux; \
 # Install uv / uvx (required by MCPs that ship as Python packages —
 # time, fetch, mcp-atlassian). Without this, those MCPs fail at startup
 # with "uvx: not found".
-ARG UV_VERSION=0.5.14
+ARG UV_VERSION=0.11.22
 RUN set -eux; \
     arch=$(uname -m); \
     case "$arch" in \
@@ -84,8 +89,13 @@ RUN set -eux; \
 # inherited by every container process, so when the agent user runs
 # `uvx mcp-atlassian`, uv finds the pre-installed tool instead of
 # re-downloading.
+# UV_PYTHON_PREFERENCE=only-system: uv >=0.8.0 validates that discovered
+# interpreters match the python preference and may otherwise auto-download a
+# managed CPython, which would defeat the warm /opt/uv cache and break the
+# offline MCP handshake. Pin uv to the apk-installed system python3.
 ENV UV_TOOL_DIR=/opt/uv/tools \
-    UV_CACHE_DIR=/opt/uv/cache
+    UV_CACHE_DIR=/opt/uv/cache \
+    UV_PYTHON_PREFERENCE=only-system
 RUN mkdir -p /opt/uv \
  && uv tool install --python python3 mcp-atlassian \
  && uv tool install --python python3 mcp-server-fetch \
@@ -94,7 +104,7 @@ RUN mkdir -p /opt/uv \
 
 # Install bun (required by the official telegram plugin which ships a bun-
 # runtime MCP server, and useful for any other modern JS tooling).
-ARG BUN_VERSION=1.1.38
+ARG BUN_VERSION=1.3.14
 RUN set -eux; \
     apk add --no-cache libgcc libstdc++; \
     apk add --no-cache --virtual .bun-unpack unzip; \
@@ -113,12 +123,64 @@ RUN set -eux; \
     apk del .bun-unpack; \
     bun --version
 
+# Install GitHub's official github-mcp-server Go binary (feature 004/US3),
+# replacing the deprecated `npx @modelcontextprotocol/server-github`. The Linux
+# release assets are STATICALLY linked (verified `file` → "statically linked"),
+# so they run on Alpine/musl with no extra apk packages — exactly like the
+# gum/uv/bun blocks. Baked into /usr/local/bin (outside /home/agent, so the
+# .state bind-mount can't shadow it) and invoked `github-mcp-server stdio`,
+# authenticating via GITHUB_PERSONAL_ACCESS_TOKEN. Pinned via ARG (tracked in
+# scripts/lib/versions.sh; a bats drift-guard enforces ARG==floor). Checksum
+# verified before use.
+ARG GH_MCP_VERSION=1.4.0
+RUN set -eux; \
+    arch=$(uname -m); \
+    case "$arch" in \
+      x86_64) gh_arch="x86_64" ;; \
+      aarch64) gh_arch="arm64" ;; \
+      *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    cd /tmp; \
+    base="https://github.com/github/github-mcp-server/releases/download/v${GH_MCP_VERSION}"; \
+    curl -fsSL -O "${base}/github-mcp-server_Linux_${gh_arch}.tar.gz"; \
+    curl -fsSL -O "${base}/github-mcp-server_${GH_MCP_VERSION}_checksums.txt"; \
+    grep "github-mcp-server_Linux_${gh_arch}.tar.gz" "github-mcp-server_${GH_MCP_VERSION}_checksums.txt" | sha256sum -c -; \
+    tar -xzf "github-mcp-server_Linux_${gh_arch}.tar.gz" github-mcp-server; \
+    mv github-mcp-server /usr/local/bin/github-mcp-server; \
+    chmod +x /usr/local/bin/github-mcp-server; \
+    rm -f "github-mcp-server_Linux_${gh_arch}.tar.gz" "github-mcp-server_${GH_MCP_VERSION}_checksums.txt"; \
+    github-mcp-server --version
+
 # Install Claude Code CLI globally so both root (for first-run chown) and
 # the `agent` user can invoke it. Pinned via build arg so rebuilds are
 # reproducible — override with `docker build --build-arg CLAUDE_CODE_VERSION=...`
 # or pass through compose's `build.args` to track upstream releases.
-ARG CLAUDE_CODE_VERSION=2.1.119
+ARG CLAUDE_CODE_VERSION=2.1.170
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+
+# Pre-warm the npm-based MCP servers the template wires via npx (filesystem,
+# vault). Same rationale as the uv /opt block above: a download inside Claude's
+# MCP handshake window times out, and on macOS Docker Desktop the npm cache's
+# thousands of small-file create/rename/rmdir ops fail outright on the VirtioFS
+# bind-mount that backs /home/agent (errno -35 / ENOTEMPTY). NPM_CONFIG_CACHE
+# moves BOTH the content cache (_cacache) and the npx install dir (_npx) to
+# /opt/npm-cache — off the bind-mount — and PREFER_OFFLINE lets the runtime npx
+# resolve the warmed version with no registry round-trip. `npm exec -- true`
+# downloads each package without launching its stdio server (which would hang
+# the build); `|| true` keeps the warm fail-soft. Pinned via ARG (tracked in
+# scripts/lib/versions.sh; a bats drift-guard enforces ARG==floor) so the
+# runtime spec matches the warmed spec — a version mismatch silently defeats
+# the warm hit. Numeric chown like the uv block (the agent user does not exist
+# yet). These ENV vars are inherited by every container process.
+ARG MCP_FILESYSTEM_VERSION=2026.1.14
+ARG MCP_VAULT_VERSION=0.12.0
+ENV NPM_CONFIG_CACHE=/opt/npm-cache \
+    NPM_CONFIG_PREFER_OFFLINE=true
+RUN set -eux; \
+    mkdir -p /opt/npm-cache; \
+    npm exec -y --package="@modelcontextprotocol/server-filesystem@${MCP_FILESYSTEM_VERSION}" -- true || true; \
+    npm exec -y --package="@bitbonsai/mcpvault@${MCP_VAULT_VERSION}" -- true || true; \
+    chown -R ${UID}:${GID} /opt/npm-cache
 
 # Create the non-root agent user matching host UID/GID.
 # Release pre-existing groups/users that already hold the target GID/UID
@@ -142,11 +204,13 @@ COPY scripts/start_services.sh /opt/agent-admin/scripts/start_services.sh
 COPY scripts/wizard-container.sh /opt/agent-admin/scripts/wizard-container.sh
 COPY scripts/write_container_info.sh /opt/agent-admin/scripts/write_container_info.sh
 COPY scripts/apply_telegram_typing_patch.py /opt/agent-admin/scripts/apply_telegram_typing_patch.py
+COPY scripts/qmd_watch.sh /opt/agent-admin/scripts/qmd_watch.sh
 RUN chmod +x /opt/agent-admin/entrypoint.sh \
              /opt/agent-admin/scripts/start_services.sh \
              /opt/agent-admin/scripts/wizard-container.sh \
              /opt/agent-admin/scripts/write_container_info.sh \
-             /opt/agent-admin/scripts/apply_telegram_typing_patch.py
+             /opt/agent-admin/scripts/apply_telegram_typing_patch.py \
+             /opt/agent-admin/scripts/qmd_watch.sh
 
 # Heartbeat CLI and helper libs (image-baked, stable code).
 COPY scripts/heartbeatctl /opt/agent-admin/scripts/heartbeatctl
@@ -156,6 +220,8 @@ COPY scripts/lib/backup_identity.sh /opt/agent-admin/scripts/lib/backup_identity
 COPY scripts/lib/backup_vault.sh    /opt/agent-admin/scripts/lib/backup_vault.sh
 COPY scripts/lib/backup_config.sh   /opt/agent-admin/scripts/lib/backup_config.sh
 COPY scripts/lib/token_health.sh    /opt/agent-admin/scripts/lib/token_health.sh
+COPY scripts/lib/plugin-install.sh /opt/agent-admin/scripts/lib/plugin-install.sh
+COPY scripts/lib/qmd_index.sh       /opt/agent-admin/scripts/lib/qmd_index.sh
 COPY scripts/check_token_health.sh  /opt/agent-admin/scripts/check_token_health.sh
 RUN chmod +x /opt/agent-admin/scripts/heartbeatctl \
               /opt/agent-admin/scripts/check_token_health.sh \
