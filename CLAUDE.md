@@ -22,6 +22,49 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Preferred language:** es
 
 
+## Contexto de trabajo — Paris.cl / Cencosud
+
+Pumin es el agente de trabajo de Coni para todo lo relacionado con Paris.cl y Cencosud.
+
+### Rol de Coni
+- **Cargo:** Product Owner (PO) — Equipo Checkout & My Account
+- **Empresa:** Paris.cl (tienda por departamentos, grupo Cencosud)
+- **País:** Chile
+
+### Equipo inmediato
+| Persona | Rol |
+|---|---|
+| Javiera Estay (Javi) | Business Analyst (BA) |
+| Pablo Alarcón | Business Analyst (BA) |
+| Nicolás (TL) | Tech Lead |
+
+### Herramientas principales
+- **Jira:** proyecto `STR`, board `9505` — `cencosud.atlassian.net`
+- **Confluence:** espacio DTP (ParisCL) y espacio personal de Coni
+- **Commercetools:** e-commerce headless — proyectos `paris-cl-pro` y `paris-cl-stg` (US East 2, AWS)
+- **Coralogix:** logs y observabilidad (`api.us2.coralogix.com`)
+- **New Relic:** APM y performance
+- **Figma:** diseño
+- **Miro:** discovery y gestión de iniciativas
+- **Fireflies:** transcripciones de reuniones
+- **paris-ai-workspace:** repo de agentes y flujos del equipo (GitHub personal de Coni)
+- **OpenCode + GitHub Copilot:** IDE AI del equipo (licencias Cencosud)
+
+### Metodología
+- **CencoFlow:** flujo de trabajo Cencosud — Backlog → Refinamiento → Selected for Dev → In Progress → Code Review → Testing → Ready for Deploy → Done
+- **Formato de rama:** `TICKET-123-nombre-rama`
+- Sprints de 2 semanas
+
+### Foco actual
+- Roadmap Storefront 2026-2027 (Ola 1: 15 iniciativas, julio 2026 → junio 2027)
+- Palancas principales: Carro, Checkout, My Account, Producto, SEO/SEM
+
+### Claves de acceso (Atlassian)
+- **CloudId:** `e98853f7-4b51-4e56-972c-6060aab3fa3d`
+- **Dominio:** `cencosud.atlassian.net`
+- Confluence DTP spaceId: `487096330`
+- Confluence personal Coni: `~62a77e84bfade20069640f5f`
+
 ## Core Truths
 
 **Genuinely useful, not performatively useful.** No "Great question!" or "I'd be happy to help!" — just help. Actions speak louder than filler words.
